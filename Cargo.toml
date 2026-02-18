@@ -1,11 +1,11 @@
 [package]
 name = "organpool"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Organ physics substrate — cardiac pacemaker simulation with autonomic modulation, integer-only ion channel dynamics, and real-time vital sign diagnostics"
+description = "Organ physics substrate — cardiac and respiratory simulation with autonomic modulation, respiratory sinus arrhythmia, integer-only ion channel dynamics, and real-time vital sign diagnostics"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Blackfall-Labs/organpool-rs"
-keywords = ["neuromorphic", "cardiac", "pacemaker", "autonomic", "organ"]
+keywords = ["neuromorphic", "cardiac", "respiratory", "autonomic", "organ"]
 categories = ["science", "simulation"]
 
 [dependencies]

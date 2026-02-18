@@ -157,6 +157,18 @@ fn integer_sine(phase: u16) -> i8 {
     SINE_TABLE[(phase >> 8) as usize]
 }
 
+/// Source of respiratory sinus arrhythmia (RSA) modulation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RsaSource {
+    /// Internal sine oscillator at ~0.25 Hz. Produces synthetic RSA without
+    /// real respiratory input. This is the default for backward compatibility.
+    Internal,
+    /// External respiratory signal via `Arc<AtomicU8>`. The lung thread writes
+    /// vagal modulation values; the heart reads them and uses them to modulate
+    /// the ACh level. Requires coupling to a `RespiratoryPipeline`.
+    External,
+}
+
 /// Configuration for heart rate variability generation.
 ///
 /// HRV arises from three physiological sources:
@@ -173,9 +185,13 @@ pub struct HrvConfig {
     pub enabled: bool,
     /// PRNG seed for deterministic jitter.
     pub seed: u64,
+    /// RSA source — internal sine oscillator or external respiratory signal.
+    pub rsa_source: RsaSource,
     /// RSA amplitude — max threshold jitter in mV from respiratory oscillation.
+    /// Only used when `rsa_source == RsaSource::Internal`.
     pub rsa_amplitude: i16,
     /// RSA frequency — phase increment per beat. ~14000 for 0.25 Hz at 70 BPM.
+    /// Only used when `rsa_source == RsaSource::Internal`.
     pub rsa_frequency: u16,
     /// LF amplitude — max threshold jitter in mV from baroreflex oscillation.
     pub lf_amplitude: i16,
@@ -190,6 +206,7 @@ impl Default for HrvConfig {
         Self {
             enabled: false,
             seed: 0xDEAD_BEEF_CAFE_BABE,
+            rsa_source: RsaSource::Internal,
             rsa_amplitude: 3,
             rsa_frequency: 14000,
             lf_amplitude: 2,
@@ -203,7 +220,9 @@ impl Default for HrvConfig {
 pub struct HrvGenerator {
     /// xorshift64 PRNG state.
     rng_state: u64,
-    /// RSA oscillator phase (wraps at u16::MAX).
+    /// RSA source — internal sine oscillator or external respiratory signal.
+    rsa_source: RsaSource,
+    /// RSA oscillator phase (wraps at u16::MAX). Only used with Internal RSA.
     rsa_phase: u16,
     rsa_frequency: u16,
     rsa_amplitude: i16,
@@ -219,6 +238,7 @@ impl HrvGenerator {
     fn new(config: &HrvConfig) -> Self {
         Self {
             rng_state: config.seed,
+            rsa_source: config.rsa_source.clone(),
             rsa_phase: 0,
             rsa_frequency: config.rsa_frequency,
             rsa_amplitude: config.rsa_amplitude,
@@ -244,10 +264,18 @@ impl HrvGenerator {
     /// Called once per cycle at the Refractory → Diastolic transition.
     /// Returns the threshold offset in mV (can be positive or negative).
     fn cycle_jitter(&mut self) -> i16 {
-        // RSA component
-        let rsa = (integer_sine(self.rsa_phase) as i32 * self.rsa_amplitude as i32) / 127;
+        // RSA component — only from internal sine oscillator.
+        // When External, real RSA comes via AtomicU8 ACh modulation,
+        // not threshold jitter.
+        let rsa = if self.rsa_source == RsaSource::Internal {
+            let val = (integer_sine(self.rsa_phase) as i32 * self.rsa_amplitude as i32) / 127;
+            self.rsa_phase = self.rsa_phase.wrapping_add(self.rsa_frequency);
+            val
+        } else {
+            0
+        };
 
-        // LF component
+        // LF component (always active — baroreflex is independent of respiration)
         let lf = (integer_sine(self.lf_phase) as i32 * self.lf_amplitude as i32) / 127;
 
         // Intrinsic jitter — random in [-jitter, +jitter]
@@ -260,8 +288,7 @@ impl HrvGenerator {
             0
         };
 
-        // Advance oscillator phases for next cycle
-        self.rsa_phase = self.rsa_phase.wrapping_add(self.rsa_frequency);
+        // Advance LF oscillator phase for next cycle
         self.lf_phase = self.lf_phase.wrapping_add(self.lf_frequency);
 
         (rsa + lf + noise as i32) as i16
@@ -667,6 +694,7 @@ impl Default for CardiacConfig {
                 hrv: HrvConfig {
                     enabled: true,
                     seed: 0xDEAD_BEEF_CAFE_BABE,
+                    rsa_source: RsaSource::Internal,
                     rsa_amplitude: 3,    // ±3mV RSA
                     rsa_frequency: 14000, // ~0.25 Hz at 70 BPM
                     lf_amplitude: 2,     // ±2mV LF

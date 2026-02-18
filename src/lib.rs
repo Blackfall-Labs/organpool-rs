@@ -1,28 +1,31 @@
-//! Organ physics substrate — cardiac pacemaker simulation.
+//! Organ physics substrate — cardiac and respiratory simulation.
 //!
-//! `organpool` simulates the cardiac conduction system: an autonomous
-//! oscillator driven by ion channel cycling (HCN → Ca²⁺ → K⁺ → refractory),
-//! modulated by the autonomic nervous system (NE accelerates, ACh decelerates).
+//! `organpool` simulates autonomous organ systems with integer-only physics,
+//! wall-clock timing, and chemical modulation by the autonomic nervous system.
 //!
-//! The heart runs its own thread with its own chemical environment.
-//! External sources inject chemicals; the heart metabolizes them internally.
-//! If nothing injects, chemicals decay to resting baselines and the heart
-//! beats at its intrinsic rate. A denervated heart still beats — like a
-//! transplanted human heart.
+//! # Organs
+//!
+//! **Heart** — 4-zone cardiac conduction (SA → AV → Conduction → Myocardium)
+//! with ion channel cycling, escape rhythms, gap junctions, calcium clock,
+//! and HRV generation. Modulated by NE (sympathetic), ACh (parasympathetic),
+//! and cortisol.
+//!
+//! **Lungs** — Respiratory cycle (Inspiration → EndInspiratory → Expiration →
+//! EndExpiratory) with central pattern generator, CO2/O2 gas exchange, and
+//! autonomic modulation. Couples to the heart via respiratory sinus arrhythmia.
+//!
+//! Each organ runs its own thread with its own chemical environment.
+//! External sources inject chemicals; the organ metabolizes them internally.
+//! If nothing injects, chemicals decay to resting baselines and the organ
+//! operates at its intrinsic rate. Denervated organs still function.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Brain injects ──→ [mpsc channel] ──→ Heart's chemical pool (internal)
-//!                                           │ metabolism (enzymatic decay)
-//!                                           ↓
-//! SA Node → AV Node → Conduction → Myocardium → BeatEvent channel
+//! Brain injects ──→ Heart (thread) ──→ BeatEvent channel
+//!                        ↑ RSA (AtomicU8)
+//! Brain injects ──→ Lungs (thread) ──→ BreathEvent channel
 //! ```
-//!
-//! - **SA node**: Master pacemaker with intrinsic HCN leak current
-//! - **AV node**: Delay gate preventing atrial/ventricular overlap
-//! - **Conduction**: Bundle of His + Purkinje fibers
-//! - **Myocardium**: Contractile mass — its firing IS the heartbeat
 //!
 //! # Usage
 //!
@@ -48,15 +51,23 @@
 
 pub mod cardiac;
 pub mod pipeline;
+pub mod respiratory;
+pub mod respiratory_pipeline;
+pub mod respiratory_vitals;
 pub mod vitals;
 
 #[cfg(feature = "fibertract")]
 pub mod bridge;
 
-// Re-export primary types at crate root
-pub use cardiac::{CalciumClockConfig, CardiacConfig, CardiacPhase, CardiacZone, GapJunctionConfig, HrvConfig, MetabolismConfig, ZoneConfig};
+// Re-export cardiac types
+pub use cardiac::{CalciumClockConfig, CardiacConfig, CardiacPhase, CardiacZone, GapJunctionConfig, HrvConfig, MetabolismConfig, RsaSource, ZoneConfig};
 pub use pipeline::{CardiacPipeline, Chemical, ChemicalInjection, HeartHandle, HeartSnapshot};
 pub use vitals::{BeatEvent, CardiacRhythm, CardiacVitals};
+
+// Re-export respiratory types
+pub use respiratory::{RespiratoryConfig, RespiratoryPhase};
+pub use respiratory_pipeline::{LungHandle, LungSnapshot, RespiratoryChemical, RespiratoryInjection, RespiratoryPipeline};
+pub use respiratory_vitals::{BreathEvent, RespiratoryRhythm, RespiratoryVitals};
 
 #[cfg(feature = "fibertract")]
 pub use bridge::AutonomicBridge;

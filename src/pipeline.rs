@@ -16,13 +16,13 @@
 //! A denervated heart (no injections) beats at intrinsic rate with resting
 //! vagal tone — exactly like a transplanted human heart.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::cardiac::{CardiacConfig, CardiacZone};
+use crate::cardiac::{CardiacConfig, CardiacZone, RsaSource};
 use crate::vitals::{BeatEvent, CardiacRhythm, CardiacVitals};
 
 /// Which chemical to inject.
@@ -163,7 +163,7 @@ impl ChemicalPool {
 /// computation produces meaningful integer results for u8 distances.
 /// Shorter intervals would truncate to 0 for most distances, creating
 /// a half-life-independent decay rate from the `max(1)` floor.
-fn decay_toward(current: u8, baseline: u8, elapsed_us: u64, halflife_us: u64) -> u8 {
+pub(crate) fn decay_toward(current: u8, baseline: u8, elapsed_us: u64, halflife_us: u64) -> u8 {
     if current == baseline || halflife_us == 0 {
         return current;
     }
@@ -222,6 +222,11 @@ pub struct HeartHandle {
     alive: Arc<AtomicBool>,
     /// Join handle for the heart thread.
     thread: Option<JoinHandle<HeartSnapshot>>,
+    /// Shared RSA signal for coupling to a respiratory system.
+    /// The lung thread writes vagal modulation values here;
+    /// the heart thread reads them to modulate ACh.
+    /// None if the heart was started without external RSA.
+    rsa_signal: Option<Arc<AtomicU8>>,
 }
 
 impl HeartHandle {
@@ -251,6 +256,17 @@ impl HeartHandle {
             chemical: Chemical::Cortisol,
             amount,
         });
+    }
+
+    /// Get the RSA signal atomic for coupling to a respiratory system.
+    ///
+    /// Returns `Some(Arc<AtomicU8>)` if the heart was started with
+    /// `RsaSource::External`. The respiratory pipeline writes vagal
+    /// modulation values here, and the heart reads them to set ACh level.
+    ///
+    /// Returns `None` if the heart uses internal RSA (sine oscillator).
+    pub fn rsa_signal(&self) -> Option<Arc<AtomicU8>> {
+        self.rsa_signal.clone()
     }
 
     /// Check if the heart is still running.
@@ -317,11 +333,21 @@ impl CardiacPipeline {
         let (inject_tx, inject_rx) = std::sync::mpsc::channel();
         let (beat_tx, beat_rx) = std::sync::mpsc::channel();
 
+        // Create RSA signal atomic if external RSA is requested.
+        // Initialize to the ACh baseline (30) so that before any lung
+        // writes, the heart operates at normal vagal tone.
+        let rsa_signal = if config.sa_node.hrv.rsa_source == RsaSource::External {
+            Some(Arc::new(AtomicU8::new(30)))
+        } else {
+            None
+        };
+
         let alive_clone = Arc::clone(&alive);
+        let rsa_clone = rsa_signal.clone();
 
         let thread = thread::Builder::new()
             .name("cardiac".into())
-            .spawn(move || heart_loop(config, inject_rx, alive_clone, beat_tx))
+            .spawn(move || heart_loop(config, inject_rx, alive_clone, beat_tx, rsa_clone))
             .expect("failed to spawn cardiac thread");
 
         HeartHandle {
@@ -329,6 +355,7 @@ impl CardiacPipeline {
             beats: beat_rx,
             alive,
             thread: Some(thread),
+            rsa_signal,
         }
     }
 }
@@ -343,6 +370,7 @@ fn heart_loop(
     inject_rx: Receiver<ChemicalInjection>,
     alive: Arc<AtomicBool>,
     beat_tx: Sender<BeatEvent>,
+    rsa_signal: Option<Arc<AtomicU8>>,
 ) -> HeartSnapshot {
     let now = Instant::now();
 
@@ -361,6 +389,15 @@ fn heart_loop(
         // Drain all pending injections from the channel
         while let Ok(injection) = inject_rx.try_recv() {
             pool.inject(injection.chemical, injection.amount);
+        }
+
+        // External RSA: read vagal modulation from the lung thread and
+        // set it as the ACh baseline. Brain ACh injections are additive
+        // on top — they spike ACh above the respiratory-driven floor,
+        // then metabolism decays the spike back. The respiratory
+        // oscillation persists underneath.
+        if let Some(ref signal) = rsa_signal {
+            pool.ach_baseline = signal.load(Ordering::Relaxed);
         }
 
         // Metabolize: decay chemicals toward baselines (with cross-metabolism)
