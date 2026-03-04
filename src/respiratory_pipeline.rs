@@ -102,6 +102,10 @@ pub struct LungHandle {
     pub breaths: Receiver<BreathEvent>,
     alive: Arc<AtomicBool>,
     thread: Option<JoinHandle<LungSnapshot>>,
+    /// Current arterial O2 level (0-255). Updated each lung loop iteration.
+    /// External consumers (autonomic bridge) can read this lock-free to gate
+    /// tonic chemical production based on oxygen availability.
+    o2_level: Arc<AtomicU8>,
 }
 
 impl LungHandle {
@@ -119,6 +123,15 @@ impl LungHandle {
             chemical: RespiratoryChemical::ACh,
             amount,
         });
+    }
+
+    /// Get the shared O2 level atomic. Reads are lock-free.
+    ///
+    /// The O2 level reflects arterial oxygen (0-255, baseline ~200).
+    /// The bridge reads this to gate tonic chemical production:
+    /// high O2 → normal production, low O2 → reduced production.
+    pub fn o2_signal(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.o2_level)
     }
 
     /// Check if the lungs are still running.
@@ -193,14 +206,16 @@ impl RespiratoryPipeline {
 
     fn launch(config: RespiratoryConfig, rsa_signal: Option<Arc<AtomicU8>>) -> LungHandle {
         let alive = Arc::new(AtomicBool::new(true));
+        let o2_level = Arc::new(AtomicU8::new(config.o2_baseline));
         let (inject_tx, inject_rx) = std::sync::mpsc::channel();
         let (breath_tx, breath_rx) = std::sync::mpsc::channel();
 
         let alive_clone = Arc::clone(&alive);
+        let o2_clone = Arc::clone(&o2_level);
 
         let thread = thread::Builder::new()
             .name("respiratory".into())
-            .spawn(move || lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal))
+            .spawn(move || lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal, o2_clone))
             .expect("failed to spawn respiratory thread");
 
         LungHandle {
@@ -208,6 +223,7 @@ impl RespiratoryPipeline {
             breaths: breath_rx,
             alive,
             thread: Some(thread),
+            o2_level,
         }
     }
 }
@@ -219,6 +235,7 @@ fn lung_loop(
     alive: Arc<AtomicBool>,
     breath_tx: Sender<BreathEvent>,
     rsa_signal: Option<Arc<AtomicU8>>,
+    o2_signal: Arc<AtomicU8>,
 ) -> LungSnapshot {
     let now = Instant::now();
 
@@ -252,6 +269,9 @@ fn lung_loop(
         let ventilating = lung_state.phase == RespiratoryPhase::Inspiration
             || lung_state.phase == RespiratoryPhase::Expiration;
         gas_pool.metabolize(now, ventilating, lung_state.current_tidal_volume, &config);
+
+        // Publish O2 level for external consumers (autonomic bridge)
+        o2_signal.store(gas_pool.o2, Ordering::Relaxed);
 
         // Apply autonomic + chemoreceptor modulation to generator
         generator.apply_modulation(
