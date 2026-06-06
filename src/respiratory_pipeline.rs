@@ -15,7 +15,7 @@
 //!                                               RSA → AtomicU8 → Heart
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -106,6 +106,15 @@ pub struct LungHandle {
     /// External consumers (autonomic bridge) can read this lock-free to gate
     /// tonic chemical production based on oxygen availability.
     o2_level: Arc<AtomicU8>,
+    /// Current instantaneous airflow (signed: + = inspiratory, − = expiratory), in lung-units/iteration.
+    /// Updated each loop iteration. A consumer (e.g. a voice) reads this to drive a breath/airflow sound.
+    flow: Arc<AtomicI16>,
+    /// Current lung volume (0-255 lung units; 0 = residual volume, FRC ~75). Updated each iteration — the live
+    /// air budget. Reading it lets a consumer know how much air is left to spend.
+    volume: Arc<AtomicU8>,
+    /// Current arterial CO2 level (0-255). Updated each iteration — the air-hunger signal (rises when ventilation
+    /// can't keep up; drives the urge to breathe).
+    co2_level: Arc<AtomicU8>,
 }
 
 impl LungHandle {
@@ -132,6 +141,23 @@ impl LungHandle {
     /// high O2 → normal production, low O2 → reduced production.
     pub fn o2_signal(&self) -> Arc<AtomicU8> {
         Arc::clone(&self.o2_level)
+    }
+
+    /// Get the shared instantaneous-airflow atomic (signed; + inspiratory, − expiratory). Reads are lock-free.
+    /// The magnitude of expiratory flow is what a voice rides to make a breath/airflow sound — no flow, no sound.
+    pub fn flow_signal(&self) -> Arc<AtomicI16> {
+        Arc::clone(&self.flow)
+    }
+
+    /// Get the shared lung-volume atomic (0-255; 0 = residual volume, FRC ~75) — the live air budget. Reads are
+    /// lock-free.
+    pub fn volume_signal(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.volume)
+    }
+
+    /// Get the shared CO2 atomic (0-255) — the air-hunger signal (rises when ventilation lags). Reads are lock-free.
+    pub fn co2_signal(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.co2_level)
     }
 
     /// Check if the lungs are still running.
@@ -207,15 +233,23 @@ impl RespiratoryPipeline {
     fn launch(config: RespiratoryConfig, rsa_signal: Option<Arc<AtomicU8>>) -> LungHandle {
         let alive = Arc::new(AtomicBool::new(true));
         let o2_level = Arc::new(AtomicU8::new(config.o2_baseline));
+        let flow = Arc::new(AtomicI16::new(0));
+        let volume = Arc::new(AtomicU8::new(config.frc));
+        let co2_level = Arc::new(AtomicU8::new(0));
         let (inject_tx, inject_rx) = std::sync::mpsc::channel();
         let (breath_tx, breath_rx) = std::sync::mpsc::channel();
 
         let alive_clone = Arc::clone(&alive);
         let o2_clone = Arc::clone(&o2_level);
+        let flow_clone = Arc::clone(&flow);
+        let volume_clone = Arc::clone(&volume);
+        let co2_clone = Arc::clone(&co2_level);
 
         let thread = thread::Builder::new()
             .name("respiratory".into())
-            .spawn(move || lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal, o2_clone))
+            .spawn(move || {
+                lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal, o2_clone, flow_clone, volume_clone, co2_clone)
+            })
             .expect("failed to spawn respiratory thread");
 
         LungHandle {
@@ -224,6 +258,9 @@ impl RespiratoryPipeline {
             alive,
             thread: Some(thread),
             o2_level,
+            flow,
+            volume,
+            co2_level,
         }
     }
 }
@@ -236,6 +273,9 @@ fn lung_loop(
     breath_tx: Sender<BreathEvent>,
     rsa_signal: Option<Arc<AtomicU8>>,
     o2_signal: Arc<AtomicU8>,
+    flow_signal: Arc<AtomicI16>,
+    volume_signal: Arc<AtomicU8>,
+    co2_signal: Arc<AtomicU8>,
 ) -> LungSnapshot {
     let now = Instant::now();
 
@@ -284,6 +324,12 @@ fn lung_loop(
 
         // Update respiratory phase
         let new_cycle = lung_state.update(now, &mut generator, &config);
+
+        // Publish the live airflow / volume / CO2 for external consumers (a voice rides the airflow; volume is the
+        // air budget; CO2 is the air-hunger signal).
+        flow_signal.store(lung_state.flow, Ordering::Relaxed);
+        volume_signal.store(lung_state.volume, Ordering::Relaxed);
+        co2_signal.store(gas_pool.co2, Ordering::Relaxed);
 
         // Track peak expiratory flow
         if lung_state.flow < 0 {
