@@ -322,8 +322,9 @@ fn lung_loop(
     // don't round to zero).
     let mut last_iter = now;
     let mut exhale_accum: u64 = 0;
-    // Effort × elapsed_us accumulated per volume unit expelled (tuned so max effort empties ~FRC→RV in ~1.5 s).
-    const EXHALE_SPEND_DIV: u64 = 5_000_000;
+    // Airflow × elapsed_us accumulated per volume unit expelled (tuned so a hard exhale empties ~FRC→RV in ~2 s;
+    // it slows near residual as the recoil resists and the flow falls).
+    const EXHALE_SPEND_DIV: u64 = 3_000_000;
 
     let sleep_duration = Duration::from_millis(1);
 
@@ -389,13 +390,22 @@ fn lung_loop(
             lung_state.phase = RespiratoryPhase::EndExpiratory;
             lung_state.phase_start = now;
             if lung_state.volume > 0 {
-                exhale_accum += effort as u64 * iter_us;
-                let spend = (exhale_accum / EXHALE_SPEND_DIV) as u64;
+                // AERODYNAMICS: airflow is NOT simply the effort — it depends on lung volume through elastic recoil.
+                // Above FRC the recoil AIDS the exhale (more flow for the same effort); below FRC (into the reserve)
+                // it RESISTS, so the same effort yields less flow; near residual volume you can barely push air out at
+                // all. flow = (effort_pressure + recoil) / resistance. THIS state-dependence is the non-trivial
+                // mapping the brain must learn via efference copy (phase 2c).
+                const ELASTANCE: i32 = 3; // recoil pressure per lung-unit above/below FRC
+                const RESISTANCE: i32 = 2; // airway resistance (pressure → flow)
+                let recoil = (lung_state.volume as i32 - config.frc as i32) * ELASTANCE;
+                let flow = ((effort as i32 + recoil) / RESISTANCE).clamp(0, 255) as u64; // ≤0 → recoil wins, no flow
+                lung_state.flow = -(flow as i16);
+                exhale_accum += flow * iter_us; // spend ∝ ACTUAL airflow (slow near residual — hard to empty the last)
+                let spend = exhale_accum / EXHALE_SPEND_DIV;
                 if spend > 0 {
                     exhale_accum -= spend * EXHALE_SPEND_DIV;
                     lung_state.volume = lung_state.volume.saturating_sub(spend.min(255) as u8);
                 }
-                lung_state.flow = -(effort as i16); // strong, audible expiratory push (the louder the harder you blow)
             } else {
                 lung_state.flow = 0; // empty — no more air to push out
             }
