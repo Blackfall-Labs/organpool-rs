@@ -63,6 +63,9 @@ pub struct LungState {
     pub phase_start: Instant,
     /// Effective tidal volume for this breath cycle (autonomic-modulated).
     pub current_tidal_volume: u8,
+    /// The volume the current inspiration began from — normally FRC, but LOWER after a voluntary exhale spent the
+    /// reserve, so the recovery inspiration refills the deficit (a deeper, faster GASP).
+    pub insp_start_volume: u8,
 }
 
 impl LungState {
@@ -74,6 +77,7 @@ impl LungState {
             phase: RespiratoryPhase::EndExpiratory,
             phase_start: now,
             current_tidal_volume: config.base_tidal_volume,
+            insp_start_volume: config.frc,
         }
     }
 
@@ -106,14 +110,16 @@ impl LungState {
 
         match self.phase {
             RespiratoryPhase::Inspiration => {
-                // Volume rises from FRC toward FRC + tidal volume
+                // Volume rises from where this breath STARTED (insp_start_volume) toward FRC + tidal. Normally the
+                // start is FRC (a quiet breath); after a voluntary exhale spent the reserve it is much lower, so the
+                // excursion is large and the flow fast — a GASP that refills the deficit.
                 let target_volume = config.frc.saturating_add(self.current_tidal_volume);
-                let volume_range = self.current_tidal_volume as u64;
-                if config.inspiration_us > 0 && volume_range > 0 {
-                    let progress = (elapsed_us * volume_range) / config.inspiration_us;
-                    self.volume = config.frc.saturating_add(progress.min(volume_range) as u8);
-                    // Flow = volume change rate (units per second)
-                    let flow = (volume_range * 1_000_000) / config.inspiration_us;
+                let excursion = target_volume.saturating_sub(self.insp_start_volume) as u64;
+                if config.inspiration_us > 0 && excursion > 0 {
+                    let progress = (elapsed_us * excursion) / config.inspiration_us;
+                    self.volume = self.insp_start_volume.saturating_add(progress.min(excursion) as u8);
+                    // Flow = volume change rate (units per second) — deeper refill → faster inspiratory flow (the gasp)
+                    let flow = (excursion * 1_000_000) / config.inspiration_us;
                     self.flow = flow.min(i16::MAX as u64) as i16;
                 }
 
@@ -159,7 +165,9 @@ impl LungState {
             RespiratoryPhase::EndExpiratory => {
                 // CPG drive ramps. When threshold reached, start next inspiration.
                 self.flow = 0;
-                self.volume = config.frc;
+                // Clamp DOWN to FRC only — preserve a volume left LOW by a voluntary exhale, so the next inspiration
+                // starts from the deficit and gasps to refill it (rather than snapping back up to FRC).
+                self.volume = self.volume.min(config.frc);
 
                 // Compute drive from elapsed time (not accumulated)
                 let drive = (generator.drive_rate_per_sec as u64 * elapsed_us) / 1_000_000;
@@ -169,6 +177,7 @@ impl LungState {
                 if generator.drive >= generator.effective_threshold
                     && elapsed_us >= config.end_expiratory_pause_us
                 {
+                    self.insp_start_volume = self.volume; // the breath begins from here (low = a gasp)
                     self.phase = RespiratoryPhase::Inspiration;
                     self.phase_start = now;
                     generator.reset_drive();

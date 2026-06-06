@@ -383,14 +383,22 @@ fn lung_loop(
         // VOLUNTARY forced expiration — the brain driving air OUT: a strong expiratory airflow (∝ effort) and lung
         // volume falling toward residual (below FRC, into the expiratory reserve), spending the air budget. Released
         // → the CPG resumes (it inhales to refill — a recovery gasp if the air ran low).
-        if effort > 0 && !held && lung_state.volume > 0 {
-            exhale_accum += effort as u64 * iter_us;
-            let spend = (exhale_accum / EXHALE_SPEND_DIV) as u64;
-            if spend > 0 {
-                exhale_accum -= spend * EXHALE_SPEND_DIV;
-                lung_state.volume = lung_state.volume.saturating_sub(spend.min(255) as u8);
+        if effort > 0 && !held {
+            // Park the CPG in EndExpiratory (drive ramp reset) so that on RELEASE it cleanly ramps to a fresh
+            // inspiration from the spent volume — the recovery gasp — rather than resuming a stale frozen phase.
+            lung_state.phase = RespiratoryPhase::EndExpiratory;
+            lung_state.phase_start = now;
+            if lung_state.volume > 0 {
+                exhale_accum += effort as u64 * iter_us;
+                let spend = (exhale_accum / EXHALE_SPEND_DIV) as u64;
+                if spend > 0 {
+                    exhale_accum -= spend * EXHALE_SPEND_DIV;
+                    lung_state.volume = lung_state.volume.saturating_sub(spend.min(255) as u8);
+                }
+                lung_state.flow = -(effort as i16); // strong, audible expiratory push (the louder the harder you blow)
+            } else {
+                lung_state.flow = 0; // empty — no more air to push out
             }
-            lung_state.flow = -(effort as i16); // strong, audible expiratory push (the louder the harder you blow)
         } else {
             exhale_accum = 0;
         }
