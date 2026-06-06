@@ -115,6 +115,10 @@ pub struct LungHandle {
     /// Current arterial CO2 level (0-255). Updated each iteration — the air-hunger signal (rises when ventilation
     /// can't keep up; drives the urge to breathe).
     co2_level: Arc<AtomicU8>,
+    /// VOLUNTARY BREATH-HOLD (apnea). While true, the lung freezes — no airflow, no gas exchange — so CO2 climbs and
+    /// O2 falls (the felt cost of holding the breath). An executive sets this to hold; releasing resumes the CPG,
+    /// which breathes hard against the accumulated CO2. (Involuntary break-through at extreme CO2 is a future refinement.)
+    hold: Arc<AtomicBool>,
 }
 
 impl LungHandle {
@@ -158,6 +162,12 @@ impl LungHandle {
     /// Get the shared CO2 atomic (0-255) — the air-hunger signal (rises when ventilation lags). Reads are lock-free.
     pub fn co2_signal(&self) -> Arc<AtomicU8> {
         Arc::clone(&self.co2_level)
+    }
+
+    /// HOLD / RELEASE the breath (voluntary apnea). While held, the lung freezes — no airflow, no gas exchange — so
+    /// CO2 climbs and O2 falls (the felt cost). Release resumes normal breathing.
+    pub fn set_hold(&self, on: bool) {
+        self.hold.store(on, Ordering::Relaxed);
     }
 
     /// Check if the lungs are still running.
@@ -236,6 +246,7 @@ impl RespiratoryPipeline {
         let flow = Arc::new(AtomicI16::new(0));
         let volume = Arc::new(AtomicU8::new(config.frc));
         let co2_level = Arc::new(AtomicU8::new(0));
+        let hold = Arc::new(AtomicBool::new(false));
         let (inject_tx, inject_rx) = std::sync::mpsc::channel();
         let (breath_tx, breath_rx) = std::sync::mpsc::channel();
 
@@ -244,11 +255,12 @@ impl RespiratoryPipeline {
         let flow_clone = Arc::clone(&flow);
         let volume_clone = Arc::clone(&volume);
         let co2_clone = Arc::clone(&co2_level);
+        let hold_clone = Arc::clone(&hold);
 
         let thread = thread::Builder::new()
             .name("respiratory".into())
             .spawn(move || {
-                lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal, o2_clone, flow_clone, volume_clone, co2_clone)
+                lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal, o2_clone, flow_clone, volume_clone, co2_clone, hold_clone)
             })
             .expect("failed to spawn respiratory thread");
 
@@ -261,6 +273,7 @@ impl RespiratoryPipeline {
             flow,
             volume,
             co2_level,
+            hold,
         }
     }
 }
@@ -276,6 +289,7 @@ fn lung_loop(
     flow_signal: Arc<AtomicI16>,
     volume_signal: Arc<AtomicU8>,
     co2_signal: Arc<AtomicU8>,
+    hold: Arc<AtomicBool>,
 ) -> LungSnapshot {
     let now = Instant::now();
 
@@ -305,9 +319,13 @@ fn lung_loop(
         lung_state.current_tidal_volume =
             compute_tidal_volume(chem_pool.ne, chem_pool.ach, gas_pool.co2, &config);
 
-        // Metabolize gases — CO2 production always, ventilation only during active phases
-        let ventilating = lung_state.phase == RespiratoryPhase::Inspiration
-            || lung_state.phase == RespiratoryPhase::Expiration;
+        // VOLUNTARY HOLD: while held, the breath is frozen — no gas exchange (CO2 climbs, O2 falls) and no airflow.
+        let held = hold.load(Ordering::Relaxed);
+
+        // Metabolize gases — CO2 production always, ventilation only during active phases AND when not holding
+        let ventilating = !held
+            && (lung_state.phase == RespiratoryPhase::Inspiration
+                || lung_state.phase == RespiratoryPhase::Expiration);
         gas_pool.metabolize(now, ventilating, lung_state.current_tidal_volume, &config);
 
         // Publish O2 level for external consumers (autonomic bridge)
@@ -322,8 +340,13 @@ fn lung_loop(
             &config,
         );
 
-        // Update respiratory phase
-        let new_cycle = lung_state.update(now, &mut generator, &config);
+        // Update respiratory phase — unless the breath is held, in which case the lung freezes (no airflow).
+        let new_cycle = if held {
+            lung_state.flow = 0;
+            false
+        } else {
+            lung_state.update(now, &mut generator, &config)
+        };
 
         // Publish the live airflow / volume / CO2 for external consumers (a voice rides the airflow; volume is the
         // air budget; CO2 is the air-hunger signal).
