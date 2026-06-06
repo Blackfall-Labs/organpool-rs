@@ -119,6 +119,11 @@ pub struct LungHandle {
     /// O2 falls (the felt cost of holding the breath). An executive sets this to hold; releasing resumes the CPG,
     /// which breathes hard against the accumulated CO2. (Involuntary break-through at extreme CO2 is a future refinement.)
     hold: Arc<AtomicBool>,
+    /// VOLUNTARY expiratory effort (0-255). While > 0, the brain actively drives air OUT — overriding the autonomic
+    /// cycle: a strong expiratory airflow (∝ effort, audible as a forceful breath) and the lung volume falls toward
+    /// residual (below FRC, into the expiratory reserve), spending the air budget. Released → the CPG resumes (it
+    /// inhales to refill). This is the voluntary control that bursts, sustained exhales, and eventually speech ride on.
+    exhale_effort: Arc<AtomicU8>,
 }
 
 impl LungHandle {
@@ -168,6 +173,13 @@ impl LungHandle {
     /// CO2 climbs and O2 falls (the felt cost). Release resumes normal breathing.
     pub fn set_hold(&self, on: bool) {
         self.hold.store(on, Ordering::Relaxed);
+    }
+
+    /// VOLUNTARY expiratory effort (0-255) — the brain pushing air out. 0 = let the autonomic cycle run; higher =
+    /// stronger forced exhale (louder airflow, faster air spend). A brief high effort makes a burst; a steady
+    /// moderate effort makes a sustained exhale; sustaining it runs the air low → a recovery gasp.
+    pub fn set_exhale_effort(&self, effort: u8) {
+        self.exhale_effort.store(effort, Ordering::Relaxed);
     }
 
     /// Check if the lungs are still running.
@@ -247,6 +259,7 @@ impl RespiratoryPipeline {
         let volume = Arc::new(AtomicU8::new(config.frc));
         let co2_level = Arc::new(AtomicU16::new(0));
         let hold = Arc::new(AtomicBool::new(false));
+        let exhale_effort = Arc::new(AtomicU8::new(0));
         let (inject_tx, inject_rx) = std::sync::mpsc::channel();
         let (breath_tx, breath_rx) = std::sync::mpsc::channel();
 
@@ -256,11 +269,12 @@ impl RespiratoryPipeline {
         let volume_clone = Arc::clone(&volume);
         let co2_clone = Arc::clone(&co2_level);
         let hold_clone = Arc::clone(&hold);
+        let exhale_clone = Arc::clone(&exhale_effort);
 
         let thread = thread::Builder::new()
             .name("respiratory".into())
             .spawn(move || {
-                lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal, o2_clone, flow_clone, volume_clone, co2_clone, hold_clone)
+                lung_loop(config, inject_rx, alive_clone, breath_tx, rsa_signal, o2_clone, flow_clone, volume_clone, co2_clone, hold_clone, exhale_clone)
             })
             .expect("failed to spawn respiratory thread");
 
@@ -274,6 +288,7 @@ impl RespiratoryPipeline {
             volume,
             co2_level,
             hold,
+            exhale_effort,
         }
     }
 }
@@ -290,6 +305,7 @@ fn lung_loop(
     volume_signal: Arc<AtomicU8>,
     co2_signal: Arc<AtomicU16>,
     hold: Arc<AtomicBool>,
+    exhale_effort: Arc<AtomicU8>,
 ) -> LungSnapshot {
     let now = Instant::now();
 
@@ -301,6 +317,13 @@ fn lung_loop(
 
     // Track peak expiratory flow within each breath cycle
     let mut peak_expiratory_flow: u8 = 0;
+
+    // Voluntary forced-expiration bookkeeping (per-iteration timer + fractional accumulator so slow integer spends
+    // don't round to zero).
+    let mut last_iter = now;
+    let mut exhale_accum: u64 = 0;
+    // Effort × elapsed_us accumulated per volume unit expelled (tuned so max effort empties ~FRC→RV in ~1.5 s).
+    const EXHALE_SPEND_DIV: u64 = 5_000_000;
 
     let sleep_duration = Duration::from_millis(1);
 
@@ -340,13 +363,37 @@ fn lung_loop(
             &config,
         );
 
-        // Update respiratory phase — unless the breath is held, in which case the lung freezes (no airflow).
+        // Read voluntary expiratory effort + per-iteration timing (the override below uses both).
+        let iter_us = now.duration_since(last_iter).as_micros() as u64;
+        last_iter = now;
+        let effort = exhale_effort.load(Ordering::Relaxed);
+
+        // Update respiratory phase — UNLESS the breath is held (frozen), or the brain is voluntarily driving air out.
+        // In the voluntary case the CPG is SUPPRESSED so its phase-based volume doesn't overwrite the forced exhale
+        // below FRC (the bug otherwise: update() resets volume to its phase value every iteration).
         let new_cycle = if held {
             lung_state.flow = 0;
             false
+        } else if effort > 0 {
+            false // CPG suppressed; the voluntary block below drives volume + flow
         } else {
             lung_state.update(now, &mut generator, &config)
         };
+
+        // VOLUNTARY forced expiration — the brain driving air OUT: a strong expiratory airflow (∝ effort) and lung
+        // volume falling toward residual (below FRC, into the expiratory reserve), spending the air budget. Released
+        // → the CPG resumes (it inhales to refill — a recovery gasp if the air ran low).
+        if effort > 0 && !held && lung_state.volume > 0 {
+            exhale_accum += effort as u64 * iter_us;
+            let spend = (exhale_accum / EXHALE_SPEND_DIV) as u64;
+            if spend > 0 {
+                exhale_accum -= spend * EXHALE_SPEND_DIV;
+                lung_state.volume = lung_state.volume.saturating_sub(spend.min(255) as u8);
+            }
+            lung_state.flow = -(effort as i16); // strong, audible expiratory push (the louder the harder you blow)
+        } else {
+            exhale_accum = 0;
+        }
 
         // Publish the live airflow / volume / CO2 for external consumers (a voice rides the airflow; volume is the
         // air budget; CO2 is the air-hunger signal).
