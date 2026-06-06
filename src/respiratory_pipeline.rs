@@ -15,7 +15,7 @@
 //!                                               RSA → AtomicU8 → Heart
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU16, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -105,16 +105,16 @@ pub struct LungHandle {
     /// Current arterial O2 level (0-255). Updated each lung loop iteration.
     /// External consumers (autonomic bridge) can read this lock-free to gate
     /// tonic chemical production based on oxygen availability.
-    o2_level: Arc<AtomicU8>,
+    o2_level: Arc<AtomicU16>,
     /// Current instantaneous airflow (signed: + = inspiratory, − = expiratory), in lung-units/iteration.
     /// Updated each loop iteration. A consumer (e.g. a voice) reads this to drive a breath/airflow sound.
     flow: Arc<AtomicI16>,
     /// Current lung volume (0-255 lung units; 0 = residual volume, FRC ~75). Updated each iteration — the live
     /// air budget. Reading it lets a consumer know how much air is left to spend.
     volume: Arc<AtomicU8>,
-    /// Current arterial CO2 level (0-255). Updated each iteration — the air-hunger signal (rises when ventilation
-    /// can't keep up; drives the urge to breathe).
-    co2_level: Arc<AtomicU8>,
+    /// Current arterial CO2 level (25 units/mmHg; baseline ~1000). Updated each iteration — the air-hunger signal
+    /// (rises when ventilation can't keep up; drives the urge to breathe).
+    co2_level: Arc<AtomicU16>,
     /// VOLUNTARY BREATH-HOLD (apnea). While true, the lung freezes — no airflow, no gas exchange — so CO2 climbs and
     /// O2 falls (the felt cost of holding the breath). An executive sets this to hold; releasing resumes the CPG,
     /// which breathes hard against the accumulated CO2. (Involuntary break-through at extreme CO2 is a future refinement.)
@@ -143,7 +143,7 @@ impl LungHandle {
     /// The O2 level reflects arterial oxygen (0-255, baseline ~200).
     /// The bridge reads this to gate tonic chemical production:
     /// high O2 → normal production, low O2 → reduced production.
-    pub fn o2_signal(&self) -> Arc<AtomicU8> {
+    pub fn o2_signal(&self) -> Arc<AtomicU16> {
         Arc::clone(&self.o2_level)
     }
 
@@ -159,8 +159,8 @@ impl LungHandle {
         Arc::clone(&self.volume)
     }
 
-    /// Get the shared CO2 atomic (0-255) — the air-hunger signal (rises when ventilation lags). Reads are lock-free.
-    pub fn co2_signal(&self) -> Arc<AtomicU8> {
+    /// Get the shared CO2 atomic (25 units/mmHg) — the air-hunger signal (rises when ventilation lags). Lock-free.
+    pub fn co2_signal(&self) -> Arc<AtomicU16> {
         Arc::clone(&self.co2_level)
     }
 
@@ -208,8 +208,8 @@ pub struct LungSnapshot {
     pub last_breaths_per_minute: u16,
     pub last_tidal_volume: u8,
     pub last_rhythm: RespiratoryRhythm,
-    pub final_co2: u8,
-    pub final_o2: u8,
+    pub final_co2: u16,
+    pub final_o2: u16,
     pub final_ne: u8,
     pub final_ach: u8,
 }
@@ -242,10 +242,10 @@ impl RespiratoryPipeline {
 
     fn launch(config: RespiratoryConfig, rsa_signal: Option<Arc<AtomicU8>>) -> LungHandle {
         let alive = Arc::new(AtomicBool::new(true));
-        let o2_level = Arc::new(AtomicU8::new(config.o2_baseline));
+        let o2_level = Arc::new(AtomicU16::new(config.o2_baseline));
         let flow = Arc::new(AtomicI16::new(0));
         let volume = Arc::new(AtomicU8::new(config.frc));
-        let co2_level = Arc::new(AtomicU8::new(0));
+        let co2_level = Arc::new(AtomicU16::new(0));
         let hold = Arc::new(AtomicBool::new(false));
         let (inject_tx, inject_rx) = std::sync::mpsc::channel();
         let (breath_tx, breath_rx) = std::sync::mpsc::channel();
@@ -285,10 +285,10 @@ fn lung_loop(
     alive: Arc<AtomicBool>,
     breath_tx: Sender<BreathEvent>,
     rsa_signal: Option<Arc<AtomicU8>>,
-    o2_signal: Arc<AtomicU8>,
+    o2_signal: Arc<AtomicU16>,
     flow_signal: Arc<AtomicI16>,
     volume_signal: Arc<AtomicU8>,
-    co2_signal: Arc<AtomicU8>,
+    co2_signal: Arc<AtomicU16>,
     hold: Arc<AtomicBool>,
 ) -> LungSnapshot {
     let now = Instant::now();

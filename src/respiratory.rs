@@ -221,8 +221,8 @@ impl RespiratoryGenerator {
         &mut self,
         ne: u8,
         ach: u8,
-        co2: u8,
-        o2: u8,
+        co2: u16,
+        o2: u16,
         config: &RespiratoryConfig,
     ) {
         let base = self.base_drive_rate_per_sec as u64;
@@ -262,15 +262,15 @@ impl RespiratoryGenerator {
 
 /// Gas exchange environment for the lungs.
 ///
-/// CO2 and O2 are tracked as u8 concentrations (0-255).
-/// CO2 accumulates continuously from metabolism. O2 depletes continuously.
-/// Ventilation (during Inspiration/Expiration phases) clears CO2 and
-/// replenishes O2. Clearance scales with tidal volume.
+/// CO2 and O2 are tracked as u16 concentrations at a fine scale (**25 units = 1 mmHg**), so the dynamics run on a
+/// realistic timescale (a u8 0-255 range floored the integer rates too coarsely — a breath-hold reached breakpoint
+/// in seconds). CO2 baseline ~1000 (40 mmHg); O2 baseline ~5000. CO2 accumulates continuously from metabolism; O2
+/// depletes. Ventilation (Inspiration/Expiration phases) clears CO2 and replenishes O2, scaled by tidal volume.
 pub struct GasPool {
-    /// Arterial CO2 analog (0-255). Primary respiratory drive signal.
-    pub co2: u8,
-    /// Arterial O2 analog (0-255). Secondary drive (hypoxic response).
-    pub o2: u8,
+    /// Arterial CO2 analog (25 units/mmHg; baseline ~1000). Primary respiratory drive signal.
+    pub co2: u16,
+    /// Arterial O2 analog (baseline ~5000). Secondary drive (hypoxic response).
+    pub o2: u16,
     /// Last time gas metabolism was applied.
     last_metabolism: Instant,
 }
@@ -308,12 +308,12 @@ impl GasPool {
         // CO2 production (continuous — metabolism never stops)
         let co2_produced =
             (config.co2_production_rate_per_sec as u64 * elapsed_us) / 1_000_000;
-        self.co2 = self.co2.saturating_add(co2_produced.min(255) as u8);
+        self.co2 = self.co2.saturating_add(co2_produced.min(u16::MAX as u64) as u16);
 
         // O2 consumption (continuous)
         let o2_consumed =
             (config.o2_consumption_rate_per_sec as u64 * elapsed_us) / 1_000_000;
-        self.o2 = self.o2.saturating_sub(o2_consumed.min(255) as u8);
+        self.o2 = self.o2.saturating_sub(o2_consumed.min(u16::MAX as u64) as u16);
 
         // Ventilation: clear CO2 and replenish O2 during active breathing
         if ventilating {
@@ -330,7 +330,7 @@ impl GasPool {
             if self.co2 > config.co2_baseline {
                 let distance = (self.co2 - config.co2_baseline) as u64;
                 let cleared = effective_clearance.min(distance);
-                self.co2 = self.co2.saturating_sub(cleared as u8);
+                self.co2 = self.co2.saturating_sub(cleared as u16);
             }
 
             // O2 replenishment
@@ -340,7 +340,7 @@ impl GasPool {
             if self.o2 < config.o2_baseline {
                 let distance = (config.o2_baseline - self.o2) as u64;
                 let replenished = effective_replenishment.min(distance);
-                self.o2 = self.o2.saturating_add(replenished as u8);
+                self.o2 = self.o2.saturating_add(replenished as u16);
             }
         }
     }
@@ -349,7 +349,7 @@ impl GasPool {
 /// Compute tidal volume modulated by autonomic state.
 ///
 /// NE deepens breaths. ACh makes them shallower. CO2 excess deepens breaths.
-pub fn compute_tidal_volume(ne: u8, ach: u8, co2: u8, config: &RespiratoryConfig) -> u8 {
+pub fn compute_tidal_volume(ne: u8, ach: u8, co2: u16, config: &RespiratoryConfig) -> u8 {
     let base = config.base_tidal_volume as i32;
 
     // NE deepens: up to +base at NE=255 with full sensitivity
@@ -410,15 +410,15 @@ pub struct RespiratoryConfig {
     /// ACh sensitivity for tidal volume modulation (0-255).
     pub ach_depth_sensitivity: u8,
 
-    // === Chemoreceptor ===
-    /// CO2 baseline (homeostatic target).
-    pub co2_baseline: u8,
-    /// O2 baseline.
-    pub o2_baseline: u8,
+    // === Chemoreceptor === (CO2/O2 at 25 units/mmHg; see GasPool)
+    /// CO2 baseline (homeostatic target), ~1000 = 40 mmHg.
+    pub co2_baseline: u16,
+    /// O2 baseline, ~5000.
+    pub o2_baseline: u16,
     /// CO2 sensitivity for threshold reduction (0-255).
     pub co2_sensitivity: u8,
     /// O2 threshold below which hypoxic drive kicks in.
-    pub o2_hypoxic_threshold: u8,
+    pub o2_hypoxic_threshold: u16,
     /// O2 sensitivity for threshold reduction (0-255).
     pub o2_sensitivity: u8,
 
@@ -457,7 +457,8 @@ impl Default for RespiratoryConfig {
             max_tidal_volume: 120,
             min_tidal_volume: 10,
 
-            base_drive_rate_per_sec: 64,
+            base_drive_rate_per_sec: 128, // ~15 breaths/min via the CPG ramp (CO2 now rests near baseline at the
+                                          // 25 units/mmHg scale, so it no longer boosts the rate; the ramp carries it)
             base_drive_threshold: 128,
             min_drive_threshold: 40,
 
@@ -466,20 +467,21 @@ impl Default for RespiratoryConfig {
             ne_depth_sensitivity: 100,
             ach_depth_sensitivity: 80,
 
-            co2_baseline: 40,
-            o2_baseline: 200,
-            co2_sensitivity: 128,
-            o2_hypoxic_threshold: 120,
-            o2_sensitivity: 64,
+            // 25 units = 1 mmHg. CO2 baseline 1000 (40 mmHg); O2 baseline 5000.
+            co2_baseline: 1000,
+            o2_baseline: 5000,
+            co2_sensitivity: 60,        // tuned for the 25 units/mmHg scale (was 128 on the u8 scale)
+            o2_hypoxic_threshold: 3000,
+            o2_sensitivity: 20,         // tuned for the new scale (was 64)
 
-            co2_production_rate_per_sec: 20,
-            o2_consumption_rate_per_sec: 15,
-            // Clearance must compensate for production during non-ventilating
-            // phases (EndInspiratory + EndExpiratory ≈ 36% of cycle).
-            // Need: clearance ≥ production / ventilation_fraction ≈ 20/0.64 ≈ 31.
-            // Use 35 for comfortable margin.
-            co2_clearance_rate_per_sec: 35,
-            o2_replenishment_rate_per_sec: 28,
+            // At 25 units/mmHg, the 250 ms-batch integer floor (~4 units/s = 0.16 mmHg/s) gives a realistic
+            // breath-hold: ~+10-15 mmHg (250-375 units) to the breakpoint over ~40-90 s (Grok-sourced).
+            co2_production_rate_per_sec: 4,
+            o2_consumption_rate_per_sec: 8,
+            // Clearance compensates for production over the ~64% ventilating fraction of the cycle (≥ 4/0.64 ≈ 6.3);
+            // use 12 for margin so resting CO2 settles near baseline.
+            co2_clearance_rate_per_sec: 12,
+            o2_replenishment_rate_per_sec: 20,
 
             rsa_enabled: true,
             rsa_vagal_baseline: 30,
@@ -626,12 +628,12 @@ mod tests {
         assert_eq!(lung.phase, RespiratoryPhase::EndExpiratory);
         assert_eq!(gen.drive, 0);
 
-        // Advance 1 second (drive_rate=64 → drive=64)
-        let now = base + Duration::from_secs(1);
+        // Advance 0.5 s (drive_rate=128 → drive=64, still below the 128 threshold so it accumulates without firing)
+        let now = base + Duration::from_millis(500);
         lung.update(now, &mut gen, &config);
 
         assert!(gen.drive > 0, "CPG drive should accumulate during EndExpiratory");
-        // At 64/sec for 1 second = 64
+        // At 128/sec for 0.5 second = 64
         assert_eq!(gen.drive, 64);
     }
 
@@ -689,8 +691,8 @@ mod tests {
         let base = Instant::now();
         let mut gas = GasPool::new(&config, base);
 
-        // Elevate CO2 above baseline
-        gas.co2 = 80;
+        // Elevate CO2 above baseline (1000 at 25 units/mmHg)
+        gas.co2 = 1200;
 
         // Run metabolism + ventilation for 500ms
         let now = base + Duration::from_millis(500);
@@ -698,7 +700,7 @@ mod tests {
 
         // CO2 should have decreased (clearance > production at elevated levels)
         assert!(
-            gas.co2 < 80,
+            gas.co2 < 1200,
             "Ventilation should clear CO2: got {}",
             gas.co2
         );

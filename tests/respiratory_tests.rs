@@ -218,15 +218,17 @@ fn gas_exchange_maintains_homeostasis() {
     let co2_distance = (snapshot.final_co2 as i16 - config.co2_baseline as i16).unsigned_abs();
     let o2_distance = (snapshot.final_o2 as i16 - config.o2_baseline as i16).unsigned_abs();
 
+    // CO2/O2 are at 25 units/mmHg now; "near baseline" = within a few mmHg (~150 units = 6 mmHg), generous because
+    // the snapshot can land mid-cycle (pre-breath peak).
     assert!(
-        co2_distance < 30,
+        co2_distance < 150,
         "CO2 should stay near baseline {}: got {} (distance {})",
         config.co2_baseline,
         snapshot.final_co2,
         co2_distance
     );
     assert!(
-        o2_distance < 30,
+        o2_distance < 200,
         "O2 should stay near baseline {}: got {} (distance {})",
         config.o2_baseline,
         snapshot.final_o2,
