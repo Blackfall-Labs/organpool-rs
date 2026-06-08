@@ -107,6 +107,8 @@ impl CardiacVitals {
             instant: now,
             beat_number,
             ibi_us,
+            // a neutral default; the full pipeline OVERWRITES this with NE-driven contractility (positive inotropy)
+            // at the beat. Standalone callers (vitals-only tests) get this resting-ish value.
             stroke_force: 200,
         }
     }
