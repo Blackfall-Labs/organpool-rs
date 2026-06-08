@@ -88,7 +88,7 @@ impl AutonomicBridge {
     pub fn write_interoception(&mut self, beat: &BeatEvent) {
         if let Some(afferent) = self.vagus.tract_mut(FiberTractKind::Interoceptive) {
             let ibi_signal = beat.ibi_us.min(i32::MAX as u64) as i32;
-            let pressure_signal = beat.stroke_force as i32 * 100;
+            let pressure_signal = beat.stroke_force as i32 * 25; // stroke_force is now 0..1000 (was 0..255 × 100)
             let input = vec![ibi_signal, pressure_signal];
             afferent.transmit_sensory(&input, beat.beat_number);
         }

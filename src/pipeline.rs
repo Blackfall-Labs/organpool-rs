@@ -442,11 +442,12 @@ fn heart_loop(
             // POSITIVE INOTROPY — contractile force rises with sympathetic drive: NE above resting tone makes the
             // myocardium contract HARDER (a forceful, pounding beat). At rest it sits moderate, leaving headroom so
             // the pounding heart of stress is genuinely felt as a rising PRESSURE — not the flat constant it was.
-            const RESTING_STROKE: u16 = 110;
-            // half-gain so even high sympathetic drive leaves headroom below the 255 ceiling — a pounding heart still
-            // reads clearly above rest without pinning to max (so a fresh surge is always felt as a further rise).
-            let inotropy = pool.ne.saturating_sub(pool.ne_baseline) as u16 / 2;
-            beat.stroke_force = (RESTING_STROKE + inotropy).min(255) as u8;
+            const RESTING_STROKE: u16 = 440;
+            // gain leaves headroom below the 1000 ceiling — a pounding heart still reads clearly above rest without
+            // pinning to max (so a fresh surge is always felt as a further rise). (stroke_force is u16, range 0..1000;
+            // resolution is currently NE-limited — NE is still u8 — widen NE later for finer pressure.)
+            let inotropy = pool.ne.saturating_sub(pool.ne_baseline) as u16 * 2;
+            beat.stroke_force = (RESTING_STROKE + inotropy).min(1000);
             let _ = beat_tx.send(beat);
             // Retrograde: Myocardium→Conduction (half strength)
             if config.gap_cond_myo.retrograde {

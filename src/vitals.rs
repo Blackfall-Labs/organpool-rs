@@ -36,8 +36,8 @@ pub struct BeatEvent {
     pub beat_number: u64,
     /// Microseconds since previous beat (0 for first beat).
     pub ibi_us: u64,
-    /// Contractile force of this beat (0-255).
-    pub stroke_force: u8,
+    /// Contractile force of this beat (0-1000).
+    pub stroke_force: u16,
 }
 
 /// Cardiac vital sign monitor.
@@ -108,8 +108,8 @@ impl CardiacVitals {
             beat_number,
             ibi_us,
             // a neutral default; the full pipeline OVERWRITES this with NE-driven contractility (positive inotropy)
-            // at the beat. Standalone callers (vitals-only tests) get this resting-ish value.
-            stroke_force: 200,
+            // at the beat. Standalone callers (vitals-only tests) get this resting-ish value (0..1000 range).
+            stroke_force: 800,
         }
     }
 
